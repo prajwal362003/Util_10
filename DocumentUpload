@@ -1,0 +1,323 @@
+package com.sbi.serviceImpl;
+
+import java.security.KeyStore;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+
+import java.security.SecureRandom;
+import javax.crypto.SecretKey;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManagerFactory;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.sbi.configuration.AppProperties;
+import com.sbi.dto.EDMSResponse;
+import com.sbi.utils.ClientUtility;
+import com.sbi.utils.SSLUtil;
+
+import jakarta.annotation.PostConstruct;
+
+@Service
+public class DocumentUpload {
+
+	@Autowired private AppProperties props;
+	
+	private HttpClient httpClient;
+
+	private final Logger logger = LogManager.getLogger(DocumentUpload.class);
+
+	@PostConstruct
+	public void init() throws Exception {
+		KeyStore trustStore = KeyStore.getInstance("JKS");
+		try(InputStream is = new FileInputStream(props.getKeyStorePath())){
+			trustStore.load(is, props.getKeyStorePassword().toCharArray());
+		}
+		TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+		tmf.init(trustStore);
+		SSLContext sslContext = SSLContext.getInstance("TLS");
+		sslContext.init(null, tmf.getTrustManagers(), new SecureRandom());
+		this.httpClient = HttpClient.newBuilder()
+				.sslContext(sslContext)
+				.version(HttpClient.Version.HTTP_1_1)
+				.build();
+	}
+
+	public EDMSResponse callApi(String plainText, String channelId) throws Exception {
+		logger.info("<<<<<<<<<<start>>>>>>>>"+props.getPublicKey());
+
+		// 1. Key Generation & Loading
+		SecretKey aesKey = ClientUtility.generateAESkey();
+		PublicKey edmsServerPublicKey = ClientUtility.getPublicKey(props.getPublicKey());
+		
+		//logger.info("ckycPrivateKeyPath : " + props.getCkycPrivateKeyPath());
+
+		PrivateKey privateKey = ClientUtility.getKeyFromKeyStore(props.getCkycPrivateKeyPath(), props.getPrivateKeyPassphrase().toCharArray(), null);
+
+		logger.info("<<<<<<<Step 1 Response>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+
+		// 2. Secure Random ID Generation (Replaces RandomStringUtils)
+		String randomUniqueId = generateSecureNumericId(16);
+		logger.info("random : " + randomUniqueId);
+	
+		String tokenRequest = "{\"channelID\":\"" + channelId + "\",\"uniqueSourceServerID\":\"" + randomUniqueId + "\"}";
+		logger.info("tokenRequest : " + tokenRequest);
+		
+		String encryptedUniqueSourceServerID = ClientUtility.encryptRawJSON(aesKey, edmsServerPublicKey, tokenRequest);
+
+		// SECURITY WARNING: Do not disable SSL checking in production.
+		SSLUtil.turnOfSSLChecking(); 
+
+		logger.info("encryptedUniqueSourceServerID:: " + encryptedUniqueSourceServerID);
+		logger.info("url:: " + props.getUrl());
+
+		// 3. Step 1: Initial Handshake
+		String tokenRequestOutput = sendPostRequest(encryptedUniqueSourceServerID, "");
+
+		// 4. Parse Response (Replaces StringTokenizer)
+		String[] parts = tokenRequestOutput.split(",", 2);
+		if (parts.length < 2) {
+			throw new IllegalStateException("Invalid response format from server");
+		}
+		String encReceiverAccessToken = parts[0];
+		String signedReceiverTokenHash = parts[1];
+
+		logger.info("encReceiverAccessToken >>>>>>: " + encReceiverAccessToken);
+		logger.info("signedReceiverTokenHash >>>>>: " + signedReceiverTokenHash);
+
+		logger.info("<<<<<<Step 2 Response>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+
+		// 5. Token Verification
+		String receiverAccessToken = ClientUtility.decReceiverAccessToken(privateKey, encReceiverAccessToken);
+		logger.info("receiverAccessToken : " + receiverAccessToken);
+
+		String senderTokenHash = ClientUtility.generateSenderTokenHash(receiverAccessToken);
+		logger.info("senderTokenHash : " + senderTokenHash);
+
+		boolean hashMatched = ClientUtility.verifyReceiverTokenHash(edmsServerPublicKey, signedReceiverTokenHash, senderTokenHash);
+		logger.info("hashMatched ? : " + hashMatched);
+
+		if (!hashMatched) throw new SecurityException("Token hash verification failed");
+
+		String signedSenderTokenHash1 = ClientUtility.signSenderTokenHash(privateKey, senderTokenHash);
+		// Optimized: Use replace with regex off or just trim if specific chars known
+		String signedSenderTokenHash2 = signedSenderTokenHash1.replaceAll("\\r\\n", ""); 
+		logger.info("signedSenderTokenHash : " + signedSenderTokenHash2);
+
+		String finalSignedToken = signedSenderTokenHash2 + "," + randomUniqueId;
+
+		logger.info("<<<<<<Step 3 Response>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+		logger.info("Request : " /* + plainText */);
+
+		String encryptedData = ClientUtility.encryptRawJSON(aesKey, edmsServerPublicKey, plainText);
+		logger.info("signedSenderTokenHash : " + finalSignedToken);
+
+		// 6. Step 3: Send Encrypted Data
+		String uploadResponse = sendPostRequest(encryptedData, finalSignedToken);
+		logger.info("EDMS upload Response: " + uploadResponse);
+
+		logger.info("<<<<<<Step 4 Response>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+
+		// 7. Decrypt and Parse Final Response
+		String decryptedResponse2 = ClientUtility.decryptResponse(uploadResponse, privateKey);
+		logger.info("decryptedResponse : " + decryptedResponse2);
+
+		Gson gson = new Gson();
+		EDMSResponse response = gson.fromJson(decryptedResponse2, EDMSResponse.class);
+		logger.info("response returned  " );
+		/*
+		JsonObject jsonObject = gson.fromJson(decryptedResponse2, JsonObject.class);
+		logger.info("jsonobj----------> : " + jsonObject);
+		EDMSResponse plainResponse = new EDMSResponse();
+
+		// Use .get() and .getAsString() with null checks (or use .getAsJsonPrimitive().getAsString())
+		plainResponse.setResponseCode(
+				jsonObject.has("responseCode") && !jsonObject.get("responseCode").isJsonNull()?jsonObject.get("responseCode").getAsString():"");
+		
+		logger.info("responseCode----------> : " + plainResponse.getResponseCode());
+
+		plainResponse.setResponseMsg(
+				jsonObject.has("responseMsg") && !jsonObject.get("responseMsg").isJsonNull()?jsonObject.get("responseMsg").getAsString():"");
+		logger.info("response MSG---------> : " + plainResponse.getResponseMsg());
+		
+		plainResponse.setCustomerBean(
+				jsonObject.has("customerBean") && !jsonObject.get("customerBean").isJsonNull()?jsonObject.get("customerBean").getAsString():"");
+		*/
+		return response;
+	}
+
+	/**
+	 * Helper method to handle HTTP POST requests using Java 11+ HttpClient
+	 */
+	private String sendPostRequest(String body, String tokenHeader) throws Exception {
+		logger.info("Kycupdate Upload API url >>>>>>>>>>: " + props.getUrl());
+		HttpRequest request = HttpRequest.newBuilder()
+				.uri(URI.create(props.getUrl()))
+				.header("Content-Type", "application/json")
+				.header("signedSenderTokenHash", tokenHeader)
+				.POST(HttpRequest.BodyPublishers.ofString(body))
+				.build();
+
+		HttpResponse<String> response =null;
+		try {
+			response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+			logger.info("response : " + response);
+		}catch(Exception e) {
+			e.printStackTrace();
+			logger.error("Error : ",e);
+			logger.error("Unable to connect to the server. Status: " + response+". | "+e.getMessage());
+			throw new RuntimeException("Server connection failed with status: " + response.statusCode());
+		}
+
+		if (response.statusCode() != 200) {
+			logger.info("Unable to connect to the server. Status: " + response.statusCode());
+			throw new RuntimeException("Server connection failed with status: " + response.statusCode());
+		}
+		logger.info("response body : " + response.body());
+		return response.body();
+	}
+
+	/**
+	 * Generates a cryptographically secure random numeric string.
+	 * Replaces Apache Commons RandomStringUtils.
+	 */
+	private String generateSecureNumericId(int length) {
+		SecureRandom secureRandom = new SecureRandom();
+		StringBuilder sb = new StringBuilder(length);
+		for (int i = 0; i < length; i++) {
+			sb.append(secureRandom.nextInt(10));
+		}
+		return sb.toString();
+	}
+
+
+
+
+	/*
+
+	public EDMSResponse callApi(String plainText) {
+
+		logger.info("<<<<<<<<<<start>>>>>>>>");
+
+		SecretKey aesKey = ClientUtility.generateAESkey();
+		PublicKey edmsServerPublicKey = ClientUtility.getPublicKey(publicKey);
+		logger.info("ckycPrivateKeyPath : " + ckycPrivateKeyPath);
+
+		PrivateKey privateKey = ClientUtility.getKeyFromKeyStore(ckycPrivateKeyPath, privateKeyPassphrase.toCharArray(),null);
+
+		logger.info("<<<<<<<Step 1 Response>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+
+		String abc = RandomStringUtils.randomNumeric(16);
+		logger.info("random : " + abc);
+		String uniqueSourceServerID2 = "{\"channelID\":\"WF\",\"uniqueSourceServerID\":\"" + abc + "\"}";
+		String encryptedUniqueSourceServerID = ClientUtility.encryptRawJSON(aesKey, edmsServerPublicKey, uniqueSourceServerID2);
+
+		SSLUtil.turnOfSSLChecking();
+		logger.info("uniqueSourceServerID:: " + uniqueSourceServerID2);
+		logger.info("encryptedUniqueSourceServerID:: " + encryptedUniqueSourceServerID);
+
+		logger.info("url:: " + url);
+		Client restClient = Client.create();
+		WebResource webResource = restClient.resource(url);
+		ClientResponse resp = webResource.type("application/json").header("signedSenderTokenHash", "")
+				.post(ClientResponse.class, encryptedUniqueSourceServerID); // encryptedUniqueSourceServerID
+		// encryptedData
+		logger.info("resp >>>: " + resp);
+		if (resp.getStatus() != 200) {
+			System.err.println("Unable to connect to the server");
+		}
+		String output = resp.getEntity(String.class);
+		logger.info("EDMS Response: " + output);
+
+		int i = 0;
+		String[] b = { "ab", "bc" };
+		String encReceiverAccessToken = "";
+		StringTokenizer t = new StringTokenizer(output, ",");
+		while (t.hasMoreTokens() && i < 2) {
+			b[i] = t.nextToken();
+			i++;
+		}
+		encReceiverAccessToken = b[0];
+		logger.info("encReceiverAccessToken >>>>>>: " + encReceiverAccessToken);
+		String signedReceiverTokenHash = b[1];
+		logger.info("signedReceiverTokenHash >>>>>: " + signedReceiverTokenHash);
+
+		logger.info("<<<<<<Step 2 Response>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+		String receiverAccessToken = ClientUtility.decReceiverAccessToken(privateKey, encReceiverAccessToken);
+		logger.info("receiverAccessToken : " + receiverAccessToken);
+		String senderTokenHash = ClientUtility.generateSenderTokenHash(receiverAccessToken);
+		logger.info("senderTokenHash : " + senderTokenHash);
+
+		boolean hashMatched = ClientUtility.verifyReceiverTokenHash(edmsServerPublicKey, signedReceiverTokenHash,
+				senderTokenHash);
+		logger.info("hashMatched ? : " + hashMatched);
+
+		String signedSenderTokenHash1 = ClientUtility.signSenderTokenHash(privateKey, senderTokenHash);
+		String signedSenderTokenHash2 = signedSenderTokenHash1.replaceAll("\r\n", "");
+		logger.info("signedSenderTokenHash : " + signedSenderTokenHash2);
+
+		String signedSenderTokenHash = signedSenderTokenHash2.concat("," + abc + "");
+
+		logger.info("<<<<<<Step 3 Response>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+		logger.info("Request : " + plainText);
+
+		String encryptedData = ClientUtility.encryptRawJSON(aesKey, edmsServerPublicKey, plainText);
+
+		logger.info("signedSenderTokenHash : " + signedSenderTokenHash);
+
+		logger.info("url >>>>>>>>>>: "+url);
+
+		SSLUtil.turnOfSSLChecking();
+		Client restClient1 = Client.create();
+		WebResource webResource1 = restClient1.resource(url);
+
+		ClientResponse resp1 = webResource1.type("application/json")
+				.header("signedSenderTokenHash", signedSenderTokenHash)
+				.post(ClientResponse.class, encryptedData); // encryptedUniqueSourceServerID
+
+		logger.info("resp1 >>>>>>>>>>: "+resp1);
+
+		logger.info("resp1.getStatus() >>>>>>>>>>: "+resp1.getStatus());
+
+		if (resp1.getStatus() != 200) {
+			logger.info("Unable to connect to the server");
+		}
+		String output1 = resp1.getEntity(String.class);
+
+		logger.info("EDMS Response1: " + output1);
+
+		// ************************************step
+		// 4****************************************
+		logger.info("<<<<<<Step 4 Response>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+
+		EDMSResponse plainResponse = new EDMSResponse();
+		String decryptedResponse2 = ClientUtility.decryptResponse(output1, privateKey);
+		logger.info("decryptedResponse : " + decryptedResponse2);
+
+		JSONParser parser = new JSONParser();
+
+		Object obj = parser.parse(decryptedResponse2);
+		logger.info("jsonobj----------> : " + obj);
+		JSONObject jsonObject = new JSONObject(obj.toString());
+
+		plainResponse.setResponseCode(
+				jsonObject.getString("responseCode") == null ? "" : jsonObject.getString("responseCode"));
+		logger.info("responseCode----------> : " + plainResponse.getResponseCode());
+		plainResponse
+		.setResponseMsg(jsonObject.getString("responseMsg") == null ? "" : jsonObject.getString("responseMsg"));
+		logger.info("response MSG---------> : " + plainResponse.getResponseMsg());
+		return plainResponse;
+	}*/
+
+}
