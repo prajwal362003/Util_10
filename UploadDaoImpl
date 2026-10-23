@@ -1,0 +1,217 @@
+package com.sbi.DAOImpl;
+
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.Logger;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.EmptyResultDataAccessException;
+import org.springframework.jdbc.core.BeanPropertyRowMapper;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.ResultSetExtractor;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.stereotype.Repository;
+
+import com.sbi.DAO.UploadDao;
+import com.sbi.configuration.ServerConfiguration;
+import com.sbi.dto.CustomerRecord;
+import com.sbi.dto.FileParameters;
+import com.sbi.dto.UploadResult;
+
+@Repository
+public class UploadDaoImpl implements UploadDao {
+	private static final Logger logger = (Logger) LogManager.getLogger(UploadDaoImpl.class);
+	private static String hostName = ServerConfiguration.getCachedHostname();
+
+	@Autowired JdbcTemplate jdbcTemplate;
+
+	@Value("${Ckyc.customer.status}")
+	private String ckycStatusSet;
+
+	@Value("${kyc.customer.status}")
+	private String kycStatusSet;
+
+	@Value("${fetch.pending.customers}")
+	private String fetchCustomerQuery;
+	
+	@Value("${ckyc.customer.query}")
+	private String ckycCustomerQuery;
+	
+	@Value("${kyc.customer.query}")
+	private String kycCustomerQuery;
+	
+	@Value("${file.validation.query}")
+	private String fileValidationSql;
+	
+	@Value("${upload.document.history}")
+	private String uploadDocumentsSql;
+	
+	@Value("${update.status.Sql}")
+	private String updateStatusSql;
+	
+	@Value("${history.Sql}")
+	private String historySql;
+
+	@Override
+	public List<CustomerRecord> fetchPendingCustomers(String category, String lcpcName, int batchSizePerLcpc) {
+
+		//String fetchCustomerQuery= "select cif_number, Account_number,branch_code,lcpc,categary from kycupdate.kyc_perfios_customer_details where lcpc=? and categary=? and rownum<?";
+		logger.info("fetchCustomerQuery : "+fetchCustomerQuery);
+		try {
+			return jdbcTemplate.query(fetchCustomerQuery, new RowMapper<CustomerRecord>() {
+				@Override
+				public CustomerRecord mapRow(ResultSet rs, int rowNum) throws SQLException {
+					return new CustomerRecord(
+							rs.getString("cif_number"), 
+							rs.getString("branch_code"), 
+							rs.getString("account_number"), 
+							rs.getString("lcpc"), 
+							rs.getString("categary")
+							);
+				}
+			}, lcpcName, category, batchSizePerLcpc);
+		}catch(Exception e) {
+			logger.info("Exception e : ",e);
+			return Collections.emptyList();
+		}
+	}
+
+	@Override
+	public boolean getCustomerStatus(String cif, String branchCode, String accountNumber) {
+		String status="";
+
+		//String ckycCustomerQuery="select status from ckyc.ckyc_customer_details where cif_number =?"; //null/IP/SB/USB/S/SS/ASB/AUSB
+		logger.info("ckycCustomerQuery : "+ckycCustomerQuery);
+		try {
+			if(jdbcTemplate==null) logger.info("jdbcTemplate is null");
+			status=jdbcTemplate.queryForObject(ckycCustomerQuery, String.class,cif);
+		}catch(EmptyResultDataAccessException e) {
+			logger.error("Exception : ",e.getMessage());
+			status="";
+		}catch(Exception e) {
+			logger.error("Exception : ",e);
+			status="";
+		}
+
+		List<String> ckycStatusList=Arrays.asList(ckycStatusSet.split(","));
+
+		if(status==null||status.isEmpty()||ckycStatusList.contains(status)){
+
+			List<String> kycStatusList=Arrays.asList(kycStatusSet.split(","));
+
+		//	String kycCustomerQuery="select status from kycupdate.kyc_customer_details where cif_number =?";//null/KIP/KSB/KUSB/KS/KSS/S/SS
+			logger.info("kycCustomerQuery : "+kycCustomerQuery);
+			try {
+				status=jdbcTemplate.queryForObject(kycCustomerQuery, String.class,cif);
+			}catch(EmptyResultDataAccessException e) {
+				logger.error("Exception : ",e.getMessage());
+				status="";
+			}catch(Exception e) {
+				logger.error("Exception : ",e);;
+			}
+			return (status==null||status.isEmpty()||kycStatusList.contains(status))?true:false;
+		}
+		return false;
+	}
+
+	@Override
+	public Map<String, FileParameters> fetchValidations() {
+	//	String fileValidationSql = "SELECT * FROM kycupdate.kyc_perfios_validation";
+		logger.info("query to fetch validations: "+fileValidationSql);
+		try {
+			Map<String, FileParameters> userMap = jdbcTemplate.query(fileValidationSql, new ResultSetExtractor<Map<String, FileParameters>>() {
+				@Override
+				public Map<String, FileParameters> extractData(ResultSet rs)  {
+					Map<String, FileParameters> map = new HashMap<>();
+					try {
+						logger.info("resultSet  "+rs);
+
+						while (rs.next()) {
+							BeanPropertyRowMapper<FileParameters> mapper = new BeanPropertyRowMapper<>(FileParameters.class);
+							FileParameters bean = mapper.mapRow(rs, rs.getRow());
+							logger.info("FileParameters :  "+bean.toString());
+							map.put(bean.getFileType(), bean);
+						}
+					} catch (SQLException e) {
+						logger.info("Exception   "+e.getMessage());
+					}
+					return map;
+				}
+			});
+			logger.info("validations fetched  ");
+			return userMap;
+		}catch(EmptyResultDataAccessException e) {
+			logger.error("EmptyResultDataAccessException : ",e);
+			return Collections.emptyMap();
+		}catch(Exception e) {
+			logger.error("Exception : ",e);
+			return Collections.emptyMap();
+		}
+	}
+
+	@Override
+	public void uploadDocumentHistory(CustomerRecord customer, UploadResult uploadResult) {
+	/*	String uploadDocumentsSql ="""
+				insert into kycupdate.Rekyc_Edms_Perfios_Upload_History (cif_number, branch_code, account_number,channel_id,
+								Image_Upload_date,No_of_Documents_uploaded,Document_List,Response_code,Response_msg)
+				 values (?,?,?,?,sysdate,?,?,?,?)
+				""";*/
+		logger.info("UploadDocumentsSql: " + uploadDocumentsSql);
+		try {
+			String documentList = Optional.ofNullable(uploadResult.documentList())
+				    .orElse(Collections.emptyList())
+				    .stream()
+				    .map(Object::toString)
+				    .collect(Collectors.joining(","));
+
+			logger.info("Uploaded document List: " + documentList);
+			int a=jdbcTemplate.update(uploadDocumentsSql, customer.cif(),
+					customer.branchCode(),
+					customer.accountNumber(),
+					uploadResult.channel(),
+					String.valueOf(uploadResult.documentsUploaded()),
+					documentList, 
+					uploadResult.code(),
+					uploadResult.message());
+			logger.info(" No of rows inserted = "+a);
+		}catch(Exception e) {
+			logger.error("Error inserting entries in UploadDocumentsSql ",e);
+		}
+	}
+
+	@Override
+	public void updateMasterStatus(CustomerRecord customer, UploadResult uploadResult) {
+		//String updateStatusSql = "update kycupdate.kyc_perfios_customer_details set cif_status = 'KQ', remark =? where cif_number=? and categary = ? and lcpc=?";
+		logger.info(" update Status Sql = "+updateStatusSql);
+		try {
+			int a=jdbcTemplate.update(updateStatusSql,uploadResult.message(),customer.cif(),customer.category(),customer.lcpcName());
+			logger.info(" No of rows inserted = "+a);
+		}catch(Exception e) {
+			logger.error("Error inserting entries in UploadDocumentsSql ",e);
+		}
+	}
+
+	@Override
+	public void insertHistory(CustomerRecord customer, UploadResult uploadResult) {
+		//String historySql = "insert into kycupdate.kyc_perfios_history (cif_number, branch_code, account_number,modified_date,modified_by,server,remark) VALUES (?, ?, ?,sysdate,?,?,?)";
+		logger.info(" history Sql = "+historySql);
+		try{ 
+			int a =jdbcTemplate.update(historySql, customer.cif(),customer.branchCode(),customer.accountNumber(),"Document_Upload_Utility",hostName,uploadResult.message());
+			logger.info(" No of rows inserted = "+a);
+		}catch(Exception e) {
+			logger.error("Error inserting entries in UploadDocumentsSql ",e);
+		}
+	}
+
+
+}
