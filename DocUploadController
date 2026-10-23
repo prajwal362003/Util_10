@@ -1,0 +1,277 @@
+package com.sbi.controller;
+
+import java.io.IOException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.PropertySource;
+import org.springframework.stereotype.Controller;
+
+import com.sbi.DAO.UploadDao;
+import com.sbi.dto.CustomerRecord;
+import com.sbi.dto.FileParameters;
+import com.sbi.dto.UploadResult;
+import com.sbi.service.EdmsUploadService;
+
+
+
+/**
+ * Drives the category-wise, LCPC-wise batch upload run.
+ *
+ * Flow per requirement:
+ * 1. Category (RED/ORANGE/GREEN) comes in from the command line (main class).
+ * 2. LCPC folder names come from the properties file, comma separated.
+ * 3. One thread per LCPC folder (bounded by LCPC_THREAD_POOL_SIZE).
+ * 4. Per-customer-folder try/catch so one bad folder doesn't kill the batch or the thread.
+ * 5. Thread-safe DAO/logging calls assumed (see note at bottom).
+ */
+@Controller
+@PropertySource("file:/REKYC/UTIL_10_DOCUMENT_UPLOAD/PROPERTY/Utility_10_Document_Upload.properties")
+public class DocUploadController {
+
+    private static final Logger log = LogManager.getLogger(DocUploadController.class);
+
+    private static final List<String> VALID_CATEGORIES = Arrays.asList("RED", "ORANGE", "GREEN");
+
+    @Value("${category.Input.Root}")
+    private String categoryInputRoot;
+
+    @Value("${categorized.Input}")
+    private String categorizedInput;
+
+    @Value("${exception}")
+    private String exception;
+    
+    @Value("${lcpc.names}")
+    private String lcpcNamesList;
+    
+    private static int THREAD_COUNT;
+    
+    @Value("${Thread.Count:5}")
+    public void setThreadCount(int threadCount) {
+        THREAD_COUNT = threadCount;
+    }
+    public static int getThreadCount() {
+        return THREAD_COUNT;
+    }
+    
+    private static int BatchSize;
+
+    @Value("${Batch.Size:50}")
+    public void setBatchSize(int batchSize) {
+    	BatchSize = batchSize;
+    }
+    public static int getBatchCount() {
+        return BatchSize;
+    }
+    
+    @Autowired
+    private UploadDao uploadDao;
+
+    @Autowired
+    private EdmsUploadService edmsUploadService;
+
+    public void upload(String category) throws InterruptedException {
+
+        String normalizedCategory = normalizeCategory(category);
+
+        String[] lcpcNames = lcpcNamesList.split(",");
+        log.info("Category: " + normalizedCategory + " | No of LCPC folders fetched: " + lcpcNames.length);
+        log.info("LCPC_THREAD_POOL_SIZE: " + THREAD_COUNT );
+        
+        int poolSize = Math.min(THREAD_COUNT, lcpcNames.length);
+        log.info("poolSize: " + poolSize );
+        
+        ExecutorService executor = Executors.newFixedThreadPool(poolSize);
+        AtomicInteger totalProcessed = new AtomicInteger(0);
+        AtomicInteger totalFailed = new AtomicInteger(0);
+
+        List<Future<?>> futures = new ArrayList<>();
+        for (String lcpcName : lcpcNames) {
+            futures.add(executor.submit(() ->
+                    processLcpcFolder(normalizedCategory, lcpcName.trim(), totalProcessed, totalFailed)));
+        }
+        executor.shutdown();
+        for (Future<?> f : futures) {
+            try {
+                f.get();
+            } catch (ExecutionException e) {
+                log.error("LCPC folder processing failed", e.getCause());
+            }
+        }
+
+        log.info("Run complete for category " + normalizedCategory
+                + ". Total customer folders processed: " + totalProcessed.get()
+                + ", failed: " + totalFailed.get());
+    }
+
+    /**
+     * Processes ONE LCPC folder for the given category: fetches up to
+     * BATCH_SIZE_PER_LCPC pending customer folders (not the whole directory)
+     * and validates + uploads each.
+     */
+    private void processLcpcFolder(String category, String lcpcName,
+                                    AtomicInteger totalProcessed, AtomicInteger totalFailed) {
+
+        log.info("Starting LCPC folder: " + lcpcName + " | category: " + category);
+
+        Path lcpcFolderPath = Paths.get(categoryInputRoot, category, lcpcName);
+        if (!Files.isDirectory(lcpcFolderPath)) {
+            log.error("LCPC folder not found on disk, skipping: " + lcpcFolderPath);
+            return;
+        }
+        Map<String,FileParameters> criteriaMap = uploadDao.fetchValidations();
+		log.info("validation criteriaMap : "+criteriaMap);
+        // Fetch only the batch this run should handle, driven off the master table
+        // rather than the whole directory listing.
+        List<CustomerRecord> batch = uploadDao.fetchPendingCustomers(category, lcpcName, BatchSize);
+        log.info("LCPC " + lcpcName + " | pending customers fetched for this batch: " + batch.size());
+
+        for (CustomerRecord customer : batch) {
+            try {
+                processCustomerFolder(category, lcpcName, lcpcFolderPath, customer,criteriaMap);
+                totalProcessed.incrementAndGet();
+            } catch (Exception e) {
+                // Per-customer-folder try/catch: one bad folder must not kill the batch or the thread.
+                totalFailed.incrementAndGet();
+                log.error(e.getMessage());
+                handleFailure(category, lcpcName, Paths.get(exception, category, lcpcName), customer, e.getMessage());
+                log.error("Customer folder failed: " + folderName(customer) + " | LCPC: " + lcpcName, e);
+            }
+        }
+        log.info("Finished LCPC folder: " + lcpcName);
+    }
+    
+    
+    private void processCustomerFolder(String category, String lcpcName, Path lcpcFolderPath,
+                                        CustomerRecord customer, Map<String, FileParameters> ValidationMap) throws Exception {
+        String folderName = folderName(customer);
+        log.info("folderName : " + folderName);
+        
+        Path customerFolder = lcpcFolderPath.resolve(folderName);
+        log.info("customerFolder path : " + customerFolder);
+        
+        boolean cifStatus = uploadDao.getCustomerStatus(customer.cif(), customer.branchCode(), customer.accountNumber());
+        log.info("Cif Status : " + cifStatus);
+        
+        if (!cifStatus) {
+            log.info("Skipping " + folderName + ", already CIF under process.");
+            uploadDao.insertHistory(customer,new UploadResult(false, "","CIF under process", 0, null, ""));
+    		moveFolder(customerFolder, Paths.get(exception, category, lcpcName/* , folderName */));
+            return;
+        }
+       
+        UploadResult uploadResult = null;
+        try {
+        	uploadResult = edmsUploadService.uploadCustomerDocuments(customerFolder, customer,category,ValidationMap);
+        }catch(Exception e) {
+        	throw new RuntimeException(e.getMessage());
+        }
+        
+        log.info("Upload Succesful ? " + uploadResult.success());
+        String destination="";
+        
+        if(uploadResult.success()) {
+        	uploadDao.uploadDocumentHistory(customer,uploadResult);
+        	uploadDao.updateMasterStatus(customer,uploadResult);
+        	destination=categorizedInput;
+        }else {
+        	log.info(" Skipping a status update due to upload fail and move to exception");
+        	destination=exception;
+        }
+        Path destPath=Paths.get(destination, category, lcpcName);
+        log.info(" destination "+destPath);
+       
+        uploadDao.insertHistory(customer,uploadResult);
+		moveFolder(customerFolder, Paths.get(destination, category, lcpcName , folderName));
+    }
+
+    private void handleFailure(String category, String lcpcName, Path lcpcFolderPath,
+                                CustomerRecord customer, String reason) {
+        try {
+            uploadDao.insertHistory(customer, new UploadResult(false, "",reason, 0, null, reason));
+
+            Path customerFolder = lcpcFolderPath.resolve(folderName(customer));
+            if (Files.exists(customerFolder)) {
+                moveFolder(customerFolder, Paths.get(exception, category, lcpcName, folderName(customer)));
+            }
+        } catch (Exception e) {
+            log.error("Failed to record/move exception for " +folderName(customer), e);
+        }
+    }
+
+    private void moveFolder(Path source, Path destination) throws IOException {
+    	log.info("Source : " + source);
+    	log.info("Destination : " + destination);
+
+        try{
+        	log.info("Parent Destination : " + destination.getParent());
+        	Files.createDirectories(destination.getParent());
+        	log.info("Parent Destination created ");
+        	deleteIfExists(destination);
+        	//Files.move(source, destination, StandardCopyOption.REPLACE_EXISTING);//StandardCopyOption.ATOMIC_MOVE
+        	Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE);
+        	log.info( " —> moved to " + destination);
+        }catch(Exception nf) {
+        	log.error("Failed to record/move exception for ",nf);
+        }  
+    }
+
+    
+    private void deleteIfExists(Path processing) {
+		if (processing == null || !Files.exists(processing)) return; 
+		try {
+			Files.walkFileTree(processing, new SimpleFileVisitor<Path>() {
+				@Override
+				public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+					Files.delete(file);
+					return FileVisitResult.CONTINUE;
+				}
+				@Override
+				public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+					if (exc != null) throw exc;
+					Files.delete(dir);
+					return FileVisitResult.CONTINUE;
+				}
+			});
+		} catch (IOException e) {
+			throw new RuntimeException("Failed to delete folder: " + processing, e);
+		}
+		log.info("removed: " + processing.toString());
+	}
+    
+    private String normalizeCategory(String category) {
+        if (category == null) {
+            throw new IllegalArgumentException("Category argument is required (RED, ORANGE or GREEN)");
+        }
+        String normalized = category.trim().toUpperCase();
+        if (!VALID_CATEGORIES.contains(normalized)) {
+            throw new IllegalArgumentException("Invalid category '" + category + "', expected one of " + VALID_CATEGORIES);
+        }
+        return normalized;
+    }
+    
+    public static String folderName(CustomerRecord customer) {
+        return customer.cif() + "_" + customer.branchCode() + "_" + customer.accountNumber();
+    }
+}
