@@ -1,0 +1,52 @@
+private void moveFolder(Path source, Path destination) throws IOException {
+    log.info("Source : " + source);
+    log.info("Destination : " + destination);
+    try {
+        if (source == null || !Files.exists(source)) {
+            log.warn("Source folder not found, nothing to move: " + source);
+            return;
+        }
+        if (source.toAbsolutePath().normalize().equals(destination.toAbsolutePath().normalize())) {
+            log.warn("Source and destination are same, skipping: " + source);
+            return;
+        }
+        Files.createDirectories(destination.getParent());
+
+        Path target = destination;
+        if (Files.exists(target)) {
+            target = destination.resolveSibling(destination.getFileName() + "_" + System.currentTimeMillis());
+            log.warn("Destination already exists, moving to: " + target);
+        }
+        try {
+            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException ame) {
+            Files.move(source, target);
+        }
+        log.info(" -> moved to " + target);
+    } catch (Exception nf) {
+        log.error("Failed to move folder " + source + " -> " + destination, nf);
+    }
+}
+
+
+
+handleFailure(category, lcpcName, lcpcFolderPath, customer, e.getMessage());
+
+
+
+
+
+moveFolder(customerFolder, Paths.get(exception, category, lcpcName, folderName));
+
+
+
+
+
+if (!Files.isDirectory(customerFolder)) {
+    log.warn("Customer folder not found in input, skipping: " + customerFolder);
+    return;
+}
+
+
+
+
